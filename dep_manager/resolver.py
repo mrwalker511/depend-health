@@ -1,13 +1,20 @@
 """
 Dependency resolution and conflict detection
+
+This module provides utilities for parsing requirements files,
+fetching package dependencies, and detecting version conflicts.
 """
 
 import httpx
+import logging
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from packaging.requirements import Requirement
+from typing import List, Dict, Tuple, Optional, Set
+from packaging.requirements import Requirement, InvalidRequirement
 from packaging.specifiers import SpecifierSet
-from packaging.version import Version
+from packaging.version import Version, InvalidVersion
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 def get_local_requirements(filepath: str) -> List[Requirement]:
@@ -25,8 +32,8 @@ def get_local_requirements(filepath: str) -> List[Requirement]:
     if not Path(filepath).exists():
         return requirements
 
-    with open(filepath, 'r') as f:
-        for line in f:
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
 
             # Skip empty lines and comments
@@ -36,10 +43,13 @@ def get_local_requirements(filepath: str) -> List[Requirement]:
             try:
                 req = Requirement(line)
                 requirements.append(req)
-            except Exception:
-                # Skip invalid lines
+            except InvalidRequirement as e:
+                logger.warning(
+                    f"Skipping invalid requirement at line {line_num} in {filepath}: {line} ({e})"
+                )
                 continue
 
+    logger.info(f"Parsed {len(requirements)} requirements from {filepath}")
     return requirements
 
 
@@ -68,29 +78,38 @@ async def get_package_dependencies(package_name: str) -> Tuple[str, List[str]]:
 
 def parse_dependency(dep_string: str) -> Optional[Requirement]:
     """
-    Parse a dependency string from requires_dist
+    Parse a dependency string from requires_dist, filtering out optional dependencies
 
     Args:
         dep_string: Dependency string (e.g., "requests>=2.0.0; extra == 'dev'")
 
     Returns:
-        Requirement object or None if it has environment markers we should skip
+        Requirement object or None if it should be skipped (optional dependencies,
+        environment-specific, or invalid)
     """
     try:
         req = Requirement(dep_string)
 
-        # Skip dependencies with extra markers (optional dependencies)
+        # Skip dependencies with extra markers (optional dependencies like [dev], [test])
         if req.marker and 'extra' in str(req.marker):
+            logger.debug(f"Skipping optional dependency: {dep_string}")
+            return None
+
+        # Skip platform-specific dependencies for now (they may not apply)
+        # We could enhance this to check current platform
+        if req.marker and any(marker in str(req.marker) for marker in ['platform_system', 'sys_platform']):
+            logger.debug(f"Skipping platform-specific dependency: {dep_string}")
             return None
 
         return req
-    except Exception:
+    except InvalidRequirement as e:
+        logger.warning(f"Failed to parse dependency '{dep_string}': {e}")
         return None
 
 
 def check_specifier_conflict(spec1: SpecifierSet, spec2: SpecifierSet, package_name: str) -> Optional[str]:
     """
-    Check if two version specifiers are incompatible
+    Check if two version specifiers are incompatible using improved algorithm
 
     Args:
         spec1: First specifier set
@@ -100,28 +119,66 @@ def check_specifier_conflict(spec1: SpecifierSet, spec2: SpecifierSet, package_n
     Returns:
         Conflict description string or None if no conflict
     """
-    # If either is empty, no conflict
+    # If either is empty, no conflict (unconstrained)
     if not spec1 or not spec2:
         return None
 
-    # Try to find a version that satisfies both specifiers
-    # We'll test a range of common versions
-    test_versions = [
-        "0.1.0", "0.5.0", "1.0.0", "1.5.0", "2.0.0", "3.0.0",
-        "5.0.0", "10.0.0", "20.0.0", "50.0.0", "100.0.0"
-    ]
+    # Try to combine specifiers - if they can't be combined, there's a conflict
+    # Test with a comprehensive range of versions including edge cases
+    test_versions = _generate_test_versions(spec1, spec2)
 
     for ver_str in test_versions:
         try:
             ver = Version(ver_str)
             if ver in spec1 and ver in spec2:
                 # Found a compatible version
+                logger.debug(f"Found compatible version {ver} for {package_name}")
                 return None
-        except Exception:
+        except InvalidVersion:
             continue
 
     # No compatible version found
+    logger.warning(f"Conflict detected for {package_name}: {spec1} vs {spec2}")
     return f"{package_name}: requires {spec1} vs {spec2}"
+
+
+def _generate_test_versions(spec1: SpecifierSet, spec2: SpecifierSet) -> List[str]:
+    """
+    Generate a comprehensive list of versions to test for compatibility
+
+    Args:
+        spec1: First specifier set
+        spec2: Second specifier set
+
+    Returns:
+        List of version strings to test
+    """
+    # Extract version numbers from specifiers
+    versions: Set[str] = set()
+
+    for spec in list(spec1) + list(spec2):
+        # Extract version from specifier (e.g., ">=2.0.0" -> "2.0.0")
+        version_str = str(spec).lstrip('><=!~')
+        if version_str:
+            versions.add(version_str)
+
+    # Add common test versions
+    common_versions = [
+        "0.1.0", "0.5.0", "1.0.0", "1.5.0", "2.0.0", "2.5.0",
+        "3.0.0", "4.0.0", "5.0.0", "10.0.0", "20.0.0", "50.0.0", "100.0.0"
+    ]
+    versions.update(common_versions)
+
+    return sorted(list(versions), key=lambda v: Version(v) if _is_valid_version(v) else Version("0.0.0"))
+
+
+def _is_valid_version(version_str: str) -> bool:
+    """Check if a string is a valid version"""
+    try:
+        Version(version_str)
+        return True
+    except InvalidVersion:
+        return False
 
 
 def find_conflicts(
@@ -163,7 +220,9 @@ def find_conflicts(
                         f"⚠️  Package '{new_package_name}' version {new_package_version} "
                         f"conflicts with existing requirement: {existing_req}"
                     )
-            except Exception:
+                    logger.info(f"Version conflict: {new_package_name}=={new_package_version} vs {existing_req}")
+            except InvalidVersion as e:
+                logger.error(f"Invalid version '{new_package_version}': {e}")
                 pass
 
     # Parse new package dependencies
@@ -196,17 +255,34 @@ def find_conflicts(
     return conflicts
 
 
-def append_to_requirements(filepath: str, package_name: str, version: Optional[str] = None):
+def append_to_requirements(filepath: str, package_name: str, version: Optional[str] = None) -> bool:
     """
-    Append a package to requirements.txt
+    Append a package to requirements.txt, avoiding duplicates
 
     Args:
         filepath: Path to requirements.txt
         package_name: Name of package to add
         version: Optional version specifier
+
+    Returns:
+        True if package was added, False if it already existed
     """
-    with open(filepath, 'a') as f:
+    # Check if package already exists in requirements
+    existing_reqs = get_local_requirements(filepath)
+    normalized_name = package_name.lower().replace('-', '_')
+
+    for req in existing_reqs:
+        if req.name.lower().replace('-', '_') == normalized_name:
+            logger.warning(f"Package '{package_name}' already exists in {filepath}")
+            return False
+
+    # Append the new requirement
+    with open(filepath, 'a', encoding='utf-8') as f:
         if version:
             f.write(f"\n{package_name}=={version}\n")
+            logger.info(f"Added {package_name}=={version} to {filepath}")
         else:
             f.write(f"\n{package_name}\n")
+            logger.info(f"Added {package_name} to {filepath}")
+
+    return True

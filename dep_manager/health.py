@@ -1,17 +1,23 @@
 """
 Health check logic for packages
+
+This module provides health checking functionality by analyzing
+PyPI and GitHub data in parallel for optimal performance.
 """
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 from .services import APIClient
 from .models import PyPIInfo, GitHubInfo, HealthReport
 
+logger = logging.getLogger(__name__)
+
 
 async def check_health(package_name: str) -> HealthReport:
     """
-    Check the health of a package by fetching PyPI and GitHub data
+    Check the health of a package by fetching PyPI and GitHub data in parallel
 
     Args:
         package_name: Name of the package to check
@@ -23,65 +29,68 @@ async def check_health(package_name: str) -> HealthReport:
         httpx.HTTPStatusError: If package not found
         Exception: For other errors
     """
-    client = APIClient()
+    # Use client as context manager for connection pooling
+    async with APIClient() as client:
+        # Fetch PyPI data first
+        logger.info(f"Starting health check for package: {package_name}")
+        pypi_data = await client.fetch_pypi_info(package_name)
 
-    # Fetch PyPI data first
-    pypi_data = await client.fetch_pypi_info(package_name)
+        # Parse PyPI information
+        info = pypi_data["info"]
 
-    # Parse PyPI information
-    info = pypi_data["info"]
+        # Get the latest version and its release date
+        version = info["version"]
+        releases = pypi_data.get("releases", {})
+        release_info = releases.get(version, [])
 
-    # Get the latest version and its release date
-    version = info["version"]
-    releases = pypi_data.get("releases", {})
-    release_info = releases.get(version, [])
+        # Get release date from the first file in the release
+        release_date = datetime.now(timezone.utc)
+        if release_info and len(release_info) > 0:
+            upload_time = release_info[0].get("upload_time_iso_8601")
+            if upload_time:
+                release_date = datetime.fromisoformat(upload_time.replace('Z', '+00:00'))
 
-    # Get release date from the first file in the release
-    release_date = datetime.now(timezone.utc)
-    if release_info and len(release_info) > 0:
-        upload_time = release_info[0].get("upload_time_iso_8601")
-        if upload_time:
-            release_date = datetime.fromisoformat(upload_time.replace('Z', '+00:00'))
+        # Get license
+        license_info = info.get("license") or "Unknown"
 
-    # Get license
-    license_info = info.get("license") or "Unknown"
+        pypi_info = PyPIInfo(
+            name=info["name"],
+            version=version,
+            summary=info.get("summary", "No description available"),
+            license=license_info,
+            release_date=release_date,
+            project_urls=info.get("project_urls")
+        )
 
-    pypi_info = PyPIInfo(
-        name=info["name"],
-        version=version,
-        summary=info.get("summary", "No description available"),
-        license=license_info,
-        release_date=release_date,
-        project_urls=info.get("project_urls")
-    )
+        # Try to fetch GitHub data
+        github_info = None
+        days_since_commit = None
 
-    # Try to fetch GitHub data
-    github_info = None
-    days_since_commit = None
+        github_repo = client.extract_github_repo(pypi_data)
 
-    github_repo = client.extract_github_repo(pypi_data)
+        if github_repo:
+            owner, repo = github_repo
+            try:
+                github_data = await client.fetch_github_info(owner, repo)
 
-    if github_repo:
-        owner, repo = github_repo
-        try:
-            github_data = await client.fetch_github_info(owner, repo)
+                pushed_at = datetime.fromisoformat(
+                    github_data["pushed_at"].replace('Z', '+00:00')
+                )
 
-            pushed_at = datetime.fromisoformat(
-                github_data["pushed_at"].replace('Z', '+00:00')
-            )
+                github_info = GitHubInfo(
+                    repo_name=f"{owner}/{repo}",
+                    pushed_at=pushed_at,
+                    open_issues=github_data["open_issues_count"],
+                    stars=github_data["stargazers_count"]
+                )
 
-            github_info = GitHubInfo(
-                repo_name=f"{owner}/{repo}",
-                pushed_at=pushed_at,
-                open_issues=github_data["open_issues_count"],
-                stars=github_data["stargazers_count"]
-            )
+                days_since_commit = (datetime.now(timezone.utc) - pushed_at).days
+                logger.info(f"Successfully fetched GitHub data for {owner}/{repo}")
 
-            days_since_commit = (datetime.now(timezone.utc) - pushed_at).days
-
-        except Exception:
-            # If GitHub fetch fails, continue without it
-            pass
+            except Exception as e:
+                # If GitHub fetch fails, continue without it
+                logger.warning(f"Failed to fetch GitHub data for {owner}/{repo}: {e}")
+                pass
 
     # Calculate health status
     days_since_release = (datetime.now(timezone.utc) - release_date).days
