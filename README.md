@@ -4,10 +4,10 @@ A modern, high-performance CLI tool for checking the health and maintenance stat
 
 ## Features
 
-- 🚀 **Fast & Async**: Uses `httpx` with async/await for parallel API calls
-- 📊 **Rich Output**: Beautiful terminal output with tables and panels
-- 🩺 **Health Checks**: Analyzes PyPI and GitHub data to assess package health
-- 🎯 **Simple CLI**: Built with Typer for an intuitive command-line experience
+- **Fast & Async**: Uses `httpx` with async/await for parallel API calls
+- **Rich Output**: Beautiful terminal output with tables and panels
+- **Health Checks**: Analyzes PyPI and GitHub data to assess package health
+- **Simple CLI**: Built with Typer for an intuitive command-line experience
 
 ## Installation
 
